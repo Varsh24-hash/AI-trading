@@ -1,7 +1,8 @@
 """
-pages/Daily_Signal.py  —  AlgoTrade · Daily Signal
-Fix: add_vline x= must be a string not a pandas Timestamp.
-Fix: add_hline had wrong col=3 (should be col=1).
+📡 Daily Signal
+Live BUY / HOLD / SELL prediction using latest Yahoo Finance data.
+Uses the shared sidebar (ticker, model, engine) from sidebar_controls().
+No add_vline — uses add_shape instead to avoid Plotly annotation bug.
 """
 
 import sys, os, importlib, importlib.util
@@ -11,14 +12,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 import joblib
-from datetime import datetime, timedelta
 
+# ── Path setup ────────────────────────────────────────────────────────────────
+_PAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ══════════════════════════════════════════════════════════
-# PATH RESOLUTION
-# ══════════════════════════════════════════════════════════
-def _find_project_root() -> str:
-    current = os.path.dirname(os.path.abspath(__file__))
+def _find_root(start: str) -> str:
+    current = start
     for _ in range(10):
         if os.path.exists(os.path.join(current, "data", "live_feed.py")):
             return current
@@ -27,264 +26,96 @@ def _find_project_root() -> str:
             break
         current = parent
     raise FileNotFoundError(
-        "Could not find data/live_feed.py by walking up from:\n"
-        f"{os.path.dirname(os.path.abspath(__file__))}"
+        f"Cannot find data/live_feed.py walking up from {start}"
     )
 
 try:
-    PROJECT_ROOT = _find_project_root()
+    _ROOT = _find_root(_PAGE_DIR)
 except FileNotFoundError as _e:
     st.set_page_config(page_title="Daily Signal · AlgoTrade", layout="wide")
     st.error(str(_e))
     st.stop()
 
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
-_lf_path = os.path.join(PROJECT_ROOT, "data", "live_feed.py")
+# Load live_feed via importlib so it works regardless of package structure
+_lf_path = os.path.join(_ROOT, "data", "live_feed.py")
 _spec     = importlib.util.spec_from_file_location("live_feed", _lf_path)
-_lf       = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_lf)
+_lf_mod   = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_lf_mod)
 
-get_prediction_row  = _lf.get_prediction_row
-explain_signal_text = _lf.explain_signal_text
-FEATURE_COLS        = _lf.FEATURE_COLS
+get_prediction_row  = _lf_mod.get_prediction_row
+explain_signal_text = _lf_mod.explain_signal_text
+FEATURE_COLS        = _lf_mod.FEATURE_COLS
 
-# ══════════════════════════════════════════════════════════
-st.set_page_config(page_title="Daily Signal · AlgoTrade", layout="wide")
-# ══════════════════════════════════════════════════════════
+# ── Utils import (shared sidebar + theme) ────────────────────────────────────
+_UTILS_DIR = os.path.dirname(_PAGE_DIR)
+if _UTILS_DIR not in sys.path:
+    sys.path.insert(0, _UTILS_DIR)
 
-TICKERS = {
-    "AAPL · Apple Inc.":     "AAPL",
-    "MSFT · Microsoft":      "MSFT",
-    "GOOGL · Alphabet":      "GOOGL",
-    "AMZN · Amazon":         "AMZN",
-    "NVDA · NVIDIA":         "NVDA",
-    "META · Meta Platforms": "META",
-    "TSLA · Tesla":          "TSLA",
-    "JPM · JPMorgan":        "JPM",
-    "V · Visa":              "V",
-    "WMT · Walmart":         "WMT",
+from utils import (inject_css, page_header, section_label, glass_card, kv, pill,
+                   base_layout, TICKERS, sidebar_controls,
+                   OR, OR2, GOLD, CREAM, MUTE, GRN, RED)
+
+_MODEL_DIR = os.path.join(_ROOT, "models")
+MODEL_FILE_MAP = {
+    "xgboost":             "xgb_model.pkl",
+    "random_forest":       "random_forest_model.pkl",
+    "logistic_regression": "logistic_model.pkl",
 }
-MODEL_PATHS = {
-    "XGBoost":       "models/xgb_model.pkl",
-    "Random Forest": "models/rf_model.pkl",
-    "Logistic":      "models/lr_model.pkl",
-}
-SIG_COLOR = {"BUY": "#1D9E75", "HOLD": "#BA7517", "SELL": "#E24B4A"}
-SENT_ICON = {"bullish": "🟢", "bearish": "🔴", "neutral": "🟡"}
-SENT_BG   = {"bullish": "#0F6E56", "bearish": "#A32D2D", "neutral": "#3a3a3a"}
 
+st.set_page_config(page_title="Daily Signal · AlgoTrade AI",
+                   page_icon="📡", layout="wide")
+inject_css()
 
-@st.cache_resource
-def load_models():
+# ── Shared sidebar ────────────────────────────────────────────────────────────
+with st.sidebar:
+    cfg = sidebar_controls()
+
+ticker = cfg["ticker"]
+model  = cfg["model"]   # e.g. "xgboost"
+name   = TICKERS.get(ticker, (ticker,))[0]
+
+# ── Load model ────────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def load_model(model_key: str):
+    path = os.path.join(_MODEL_DIR, MODEL_FILE_MAP.get(model_key, "xgb_model.pkl"))
+    if not os.path.exists(path):
+        return None
+    return joblib.load(path)
+
+@st.cache_resource(show_spinner=False)
+def load_all_models():
     out = {}
-    for name, path in MODEL_PATHS.items():
-        full = os.path.join(PROJECT_ROOT, path)
-        try:
-            out[name] = joblib.load(full)
-        except Exception:
-            pass
+    for key, fname in MODEL_FILE_MAP.items():
+        path = os.path.join(_MODEL_DIR, fname)
+        if os.path.exists(path):
+            try:
+                out[key] = joblib.load(path)
+            except Exception:
+                pass
     return out
 
+all_models = load_all_models()
 
-def predict(model, features):
-    X    = pd.DataFrame([features])[FEATURE_COLS]
-    prob = float(model.predict_proba(X)[0, 1])
-    sig  = "BUY" if prob > 0.6 else ("SELL" if prob < 0.4 else "HOLD")
-    return sig, prob
-
-
-def make_shap_fig(model, features, name):
-    try:
-        import shap
-        X  = pd.DataFrame([features])[FEATURE_COLS]
-        ex = shap.LinearExplainer(model, X) if "Log" in name else shap.TreeExplainer(model)
-        sv = ex.shap_values(X)
-        if isinstance(sv, list):
-            sv = sv[1]
-        sv     = sv[0]
-        colors = ["#1D9E75" if v > 0 else "#E24B4A" for v in sv]
-        fig    = go.Figure(go.Bar(
-            x=sv, y=FEATURE_COLS, orientation="h",
-            marker_color=colors,
-            text=[f"{v:+.4f}" for v in sv], textposition="outside",
-        ))
-        fig.update_layout(
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            font_color="#C2C0B6", height=260,
-            margin=dict(l=10, r=70, t=8, b=8),
-            xaxis=dict(zeroline=True, zerolinecolor="#555", gridcolor="#2a2a2a",
-                       title="← SELL    SHAP value    BUY →"),
-            yaxis=dict(gridcolor="#2a2a2a"),
-        )
-        return fig
-    except Exception:
-        return None
-
-
-def make_price_fig(df, signal):
-    df90 = df.tail(90).copy()
-
-    # ── Convert index to string so Plotly doesn't try to do Timestamp arithmetic ──
-    last_date_str = df90.index[-1].strftime("%Y-%m-%d")
-    df90.index    = df90.index.strftime("%Y-%m-%d")
-
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                        row_heights=[0.58, 0.22, 0.20], vertical_spacing=0.03)
-
-    # Candlestick
-    fig.add_trace(go.Candlestick(
-        x=df90.index, open=df90["Open"], high=df90["High"],
-        low=df90["Low"], close=df90["Close"],
-        increasing_line_color="#1D9E75", decreasing_line_color="#E24B4A",
-        name="Price",
-    ), row=1, col=1)
-
-    # Moving averages
-    for col, color, lname in [("MA_10","#E8A838","MA10"), ("MA_50","#5B9BD5","MA50")]:
-        if col in df90:
-            fig.add_trace(go.Scatter(
-                x=df90.index, y=df90[col],
-                line=dict(color=color, width=1.2), name=lname,
-            ), row=1, col=1)
-
-    # Bollinger Bands
-    if "BB_Up" in df90:
-        fig.add_trace(go.Scatter(x=df90.index, y=df90["BB_Up"],
-            line=dict(color="#666", width=0.8, dash="dot"),
-            name="BB Up", showlegend=False), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df90.index, y=df90["BB_Lo"],
-            line=dict(color="#666", width=0.8, dash="dot"),
-            fill="tonexty", fillcolor="rgba(130,130,130,0.07)",
-            name="BB Lo", showlegend=False), row=1, col=1)
-
-    # ── Signal line: x= must be a STRING not a Timestamp ──
-    fig.add_vline(
-        x=last_date_str,
-        line_color=SIG_COLOR[signal], line_width=2, line_dash="dash",
-        annotation_text=f"  {signal}",
-        annotation_font_color=SIG_COLOR[signal],
-        annotation_font_size=13,
-    )
-
-    # MACD
-    if "MACD" in df90:
-        bar_c = ["#1D9E75" if v >= 0 else "#E24B4A" for v in df90["MACD_H"].fillna(0)]
-        fig.add_trace(go.Bar(x=df90.index, y=df90["MACD_H"],
-            marker_color=bar_c, name="MACD Hist"), row=2, col=1)
-        fig.add_trace(go.Scatter(x=df90.index, y=df90["MACD"],
-            line=dict(color="#E8A838", width=1), name="MACD"), row=2, col=1)
-        fig.add_trace(go.Scatter(x=df90.index, y=df90["MACD_Sig"],
-            line=dict(color="#5B9BD5", width=1, dash="dot"), name="Signal"), row=2, col=1)
-
-    # RSI — use shapes instead of add_hline to avoid subplot targeting issues
-    if "RSI" in df90:
-        fig.add_trace(go.Scatter(x=df90.index, y=df90["RSI"],
-            line=dict(color="#E8A838", width=1.2), name="RSI"), row=3, col=1)
-        # Draw overbought/oversold as scatter lines (safer than add_hline on subplots)
-        for lvl, clr in [(70, "#E24B4A"), (30, "#1D9E75")]:
-            fig.add_trace(go.Scatter(
-                x=[df90.index[0], df90.index[-1]],
-                y=[lvl, lvl],
-                mode="lines",
-                line=dict(color=clr, width=0.8, dash="dot"),
-                showlegend=False,
-            ), row=3, col=1)
-
-    fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        font_color="#C2C0B6", height=500, xaxis_rangeslider_visible=False,
-        margin=dict(l=8, r=8, t=28, b=8),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                    bgcolor="rgba(0,0,0,0)", font_size=11),
-    )
-    for r in (1, 2, 3):
-        fig.update_xaxes(gridcolor="#2a2a2a", row=r, col=1)
-        fig.update_yaxes(gridcolor="#2a2a2a", row=r, col=1)
-
-    return fig
-
-
-# ══════════════════════════════════════════════════════════
-#  SIDEBAR
-# ══════════════════════════════════════════════════════════
-models = load_models()
-
-with st.sidebar:
-    st.markdown("### DAILY SIGNAL")
-    ticker_label = st.selectbox("Stock", list(TICKERS.keys()))
-    ticker       = TICKERS[ticker_label]
-    available    = [k for k in MODEL_PATHS if k in models]
-    engine_name  = st.selectbox("Primary model", available or ["XGBoost"])
-    st.markdown("---")
-
-# ══════════════════════════════════════════════════════════
-#  HEADER
-# ══════════════════════════════════════════════════════════
-st.markdown(
-    "<h1 style='margin-bottom:0'>"
-    "<span style='color:#fff'>Daily</span>"
-    "<span style='color:#E8A838'> Signal</span></h1>",
-    unsafe_allow_html=True,
-)
-company = ticker_label.split("·")[1].strip() if "·" in ticker_label else ticker_label
-st.markdown(
-    f"<p style='color:#888;margin-top:2px'>"
-    f"{company} · {ticker} · Live prediction from Yahoo Finance</p>",
-    unsafe_allow_html=True,
-)
-
-if not models:
-    st.error(
-        f"No trained models found. Looked in: {PROJECT_ROOT}/models/\n"
-        "Commit xgb_model.pkl, rf_model.pkl, lr_model.pkl to your repo."
-    )
+if not all_models:
+    st.error(f"No trained models found in {_MODEL_DIR}. "
+             "Ensure xgb_model.pkl etc. are committed to your repo.")
     st.stop()
 
-# ══════════════════════════════════════════════════════════
-#  FETCH
-# ══════════════════════════════════════════════════════════
-with st.spinner(f"Fetching 2 years of {ticker} data from Yahoo Finance…"):
+# ── Fetch live data ───────────────────────────────────────────────────────────
+page_header("Daily", "Signal",
+            f"{name}  ·  {ticker}  ·  Live Yahoo Finance  ·  Model: {model.replace('_',' ').title()}")
+
+with st.spinner(f"Fetching latest market data for {ticker}…"):
     try:
         data = get_prediction_row(ticker)
-    except Exception as err:
-        st.error(f"Could not fetch live data: {err}")
-        with st.expander("🔍 Debug details"):
-            st.write("**Project root:**", PROJECT_ROOT)
-            st.write("**live_feed.py exists:**", os.path.exists(_lf_path))
-            try:
-                import yfinance as yf
-                today = datetime.today().date()
-                t   = yf.Ticker(ticker)
-                raw = t.history(start=str(today - timedelta(days=730)),
-                                end=str(today + timedelta(days=1)),
-                                auto_adjust=True, actions=False)
-                st.write(f"Raw rows: {len(raw)} | tz: {getattr(raw.index,'tz','none')}")
-                if not raw.empty:
-                    try:
-                        raw.index = raw.index.tz_localize(None)
-                    except TypeError:
-                        raw.index = raw.index.tz_convert("UTC").tz_localize(None)
-                    raw["return_1d"]     = raw["Close"].pct_change()
-                    raw["MA_10"]         = raw["Close"].rolling(10).mean()
-                    raw["MA_50"]         = raw["Close"].rolling(50).mean()
-                    raw["volatility"]    = raw["return_1d"].rolling(10).std() * (252**0.5)
-                    raw["volume_change"] = raw["Volume"].pct_change()
-                    d = raw["Close"].diff()
-                    g = d.clip(lower=0).rolling(14).mean()
-                    l = (-d.clip(upper=0)).rolling(14).mean()
-                    raw["RSI"] = 100-(100/(1+g/l.replace(0, float("nan"))))
-                    clean = raw.dropna(subset=FEATURE_COLS)
-                    st.write(f"After dropna: {len(clean)} rows")
-                    st.dataframe(clean[FEATURE_COLS].tail(3))
-            except Exception as e2:
-                st.error(f"Debug failed: {e2}")
+    except Exception as e:
+        st.error(f"Could not fetch live data: {e}")
+        st.info("Check internet connection or try a different ticker.")
         st.stop()
 
-# ══════════════════════════════════════════════════════════
-#  RENDER
-# ══════════════════════════════════════════════════════════
 df         = data["df"]
 features   = data["features"]
 latest     = data["latest"]
@@ -292,116 +123,406 @@ date_str   = data["date"]
 prev_close = data["prev_close"]
 close      = float(latest["Close"])
 pct_chg    = (close - prev_close) / prev_close * 100
+X_live     = pd.DataFrame([features])[FEATURE_COLS]
 
-if engine_name not in models:
-    engine_name = list(models.keys())[0]
+# ── Run selected model ────────────────────────────────────────────────────────
+primary_clf = all_models.get(model) or list(all_models.values())[0]
+primary_key = model if model in all_models else list(all_models.keys())[0]
 
-signal, prob = predict(models[engine_name], features)
-sig_col      = SIG_COLOR[signal]
-arrow        = "▲" if pct_chg >= 0 else "▼"
-pchg_col     = "#1D9E75" if pct_chg >= 0 else "#E24B4A"
+prob_primary = float(primary_clf.predict_proba(X_live)[0, 1])
+sig_primary  = "BUY" if prob_primary > 0.6 else ("SELL" if prob_primary < 0.4 else "HOLD")
 
-# Signal card
+SIG_COLOR = {"BUY": GRN, "SELL": RED, "HOLD": GOLD}
+SIG_PILL  = {"BUY": "green", "SELL": "red", "HOLD": "gold"}
+sig_color = SIG_COLOR[sig_primary]
+
+# ── Hero signal card ──────────────────────────────────────────────────────────
+chg_col = GRN if pct_chg >= 0 else RED
+arrow   = "▲" if pct_chg >= 0 else "▼"
+
 st.markdown(f"""
-<div style="background:#111;border:1px solid {sig_col}55;border-radius:16px;
-            padding:2rem 2.5rem;margin:1rem 0 1.5rem;
-            display:flex;justify-content:space-between;align-items:center;">
+<div style="background:rgba(28,16,8,0.9);
+            border:2px solid {sig_color}55;
+            border-radius:18px;padding:2rem 2.8rem;
+            margin:0.5rem 0 1.8rem;
+            display:flex;justify-content:space-between;
+            align-items:center;flex-wrap:wrap;gap:1.5rem">
   <div>
-    <div style="font-size:11px;letter-spacing:.1em;color:#666;
-                text-transform:uppercase;margin-bottom:4px">
-      {engine_name} · {date_str}
+    <div style="font-family:'Outfit',sans-serif;font-size:0.68rem;
+                color:{MUTE};letter-spacing:0.14em;
+                text-transform:uppercase;margin-bottom:0.5rem">
+      {model.replace('_',' ').title()}  ·  Signal for {date_str}
     </div>
-    <div style="font-size:80px;font-weight:700;color:{sig_col};line-height:1">
-      {signal}
+    <div style="font-family:'Playfair Display',serif;
+                font-size:5rem;font-weight:700;
+                color:{sig_color};line-height:0.9;
+                letter-spacing:-0.02em">
+      {sig_primary}
     </div>
-    <div style="font-size:14px;color:#999;margin-top:6px">
-      {prob*100:.1f}% probability of upward move
+    <div style="font-family:'Outfit',sans-serif;font-size:0.88rem;
+                color:{MUTE};margin-top:0.6rem">
+      {prob_primary*100:.1f}% probability of upward move tomorrow
     </div>
   </div>
   <div style="text-align:right">
-    <div style="font-size:44px;font-weight:600;color:#fff">${close:.2f}</div>
-    <div style="font-size:15px;color:{pchg_col};margin-top:4px">
-      {arrow} {pct_chg:+.2f}% vs previous close
+    <div style="font-family:'Playfair Display',serif;
+                font-size:3rem;font-weight:700;
+                color:{chg_col};line-height:1">
+      {close:,.2f}
+    </div>
+    <div style="font-size:0.9rem;color:{chg_col};margin-top:0.3rem">
+      {arrow} {abs(pct_chg):.2f}%  vs previous close
+    </div>
+    <div style="font-size:0.7rem;color:{MUTE};margin-top:0.2rem">
+      {ticker}  ·  {name}
     </div>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
-# Metrics
-c1,c2,c3,c4,c5,c6 = st.columns(6)
-c1.metric("RSI (14)",   f"{features['RSI']:.1f}")
-c2.metric("MA10",       f"${features['MA_10']:.2f}")
-c3.metric("MA50",       f"${features['MA_50']:.2f}")
-c4.metric("Return 1d",  f"{features['return_1d']*100:+.2f}%")
-c5.metric("Volatility", f"{features['volatility']*100:.1f}%")
-c6.metric("Vol Change", f"{features['volume_change']*100:+.1f}%")
-
-st.markdown("---")
-
-# All models
-if len(models) > 1:
-    st.markdown("#### All model signals")
-    mcols = st.columns(len(models))
-    for mc, (mname, mobj) in zip(mcols, models.items()):
-        ms, mp = predict(mobj, features)
-        mc.markdown(f"""
-        <div style="text-align:center;background:#1a1a1a;border-radius:12px;
-                    padding:1rem;border:1px solid {SIG_COLOR[ms]}44;margin-bottom:8px">
-          <div style="font-size:11px;color:#777;margin-bottom:4px">{mname}</div>
-          <div style="font-size:30px;font-weight:700;color:{SIG_COLOR[ms]}">{ms}</div>
-          <div style="font-size:12px;color:#999">{mp*100:.1f}%</div>
-        </div>""", unsafe_allow_html=True)
-    st.markdown("---")
-
-# Chart + SHAP
-left, right = st.columns([3, 2])
-with left:
-    st.markdown("#### Price chart — last 90 days")
-    st.plotly_chart(make_price_fig(df, signal), use_container_width=True)
-with right:
-    st.markdown("#### SHAP — feature contributions")
-    shap_fig = make_shap_fig(models[engine_name], features, engine_name)
-    if shap_fig:
-        st.plotly_chart(shap_fig, use_container_width=True)
-        st.caption("Green = pushed toward BUY · Red = pushed toward SELL")
+# ── All 3 model signals ───────────────────────────────────────────────────────
+section_label("All Model Signals")
+mcols = st.columns(3)
+model_labels = {
+    "xgboost":             "XGBoost",
+    "random_forest":       "Random Forest",
+    "logistic_regression": "Logistic Regression",
+}
+for col, (key, label) in zip(mcols, model_labels.items()):
+    if key in all_models:
+        p   = float(all_models[key].predict_proba(X_live)[0, 1])
+        s   = "BUY" if p > 0.6 else ("SELL" if p < 0.4 else "HOLD")
+        sc  = SIG_COLOR[s]
+        active_border = f"border:2px solid {sc};" if key == primary_key else f"border:1px solid {sc}44;"
+        col.markdown(f"""
+        <div style="background:rgba(28,16,8,0.8);{active_border}
+                    border-radius:12px;padding:1.3rem;text-align:center">
+          <div style="font-size:0.62rem;color:{MUTE};letter-spacing:0.1em;
+                      text-transform:uppercase;margin-bottom:0.4rem">{label}</div>
+          <div style="font-family:'Playfair Display',serif;font-size:2.2rem;
+                      font-weight:700;color:{sc}">{s}</div>
+          <div style="font-size:0.78rem;color:{MUTE};margin-top:0.3rem">
+            {p*100:.1f}% prob up
+          </div>
+          <div style="margin-top:0.5rem">{pill(s, SIG_PILL[s])}</div>
+        </div>
+        """, unsafe_allow_html=True)
     else:
-        st.info("Install `shap` to enable SHAP explanations.")
-        st.dataframe(pd.DataFrame({
-            "Feature": list(features.keys()),
-            "Value":   [round(v, 5) for v in features.values()],
-        }), hide_index=True, use_container_width=True)
+        col.markdown(f"""
+        <div style="background:rgba(28,16,8,0.5);border:1px solid rgba(180,80,20,0.15);
+                    border-radius:12px;padding:1.3rem;text-align:center">
+          <div style="font-size:0.62rem;color:{MUTE}">{label}</div>
+          <div style="font-size:0.85rem;color:{MUTE};margin-top:0.4rem">
+            Model not found
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-st.markdown("---")
+st.markdown("<br>", unsafe_allow_html=True)
 
-# Reasoning
-st.markdown("#### Why this signal? — AI reasoning")
-reasons = explain_signal_text(latest, signal, prob)
-rc = st.columns(2)
-for i, (text, sentiment) in enumerate(reasons):
-    bg = SENT_BG.get(sentiment, "#333")
-    rc[i % 2].markdown(f"""
-    <div style="background:{bg}33;border-left:3px solid {bg};border-radius:8px;
-                padding:.55rem .85rem;margin-bottom:8px;font-size:13px;
-                color:#ccc;line-height:1.5">
-      {SENT_ICON.get(sentiment,'')} {text}
-    </div>""", unsafe_allow_html=True)
+# ── Current readings strip ────────────────────────────────────────────────────
+section_label("Current Indicator Readings")
+r1, r2, r3, r4, r5, r6 = st.columns(6)
+rsi_val  = features["RSI"]
+rsi_col  = RED if rsi_val > 70 else (GRN if rsi_val < 30 else OR)
+r1.metric("RSI (14)",   f"{rsi_val:.1f}",
+          "Overbought" if rsi_val > 70 else ("Oversold" if rsi_val < 30 else "Neutral"))
+r2.metric("MA 10",      f"{features['MA_10']:.2f}")
+r3.metric("MA 50",      f"{features['MA_50']:.2f}")
+r4.metric("Return 1d",  f"{features['return_1d']*100:+.2f}%")
+r5.metric("Volatility", f"{features['volatility']*100:.1f}%")
+r6.metric("Vol Change", f"{features['volume_change']*100:+.1f}%")
 
-st.markdown("---")
+st.markdown("<br>", unsafe_allow_html=True)
 
-with st.expander("📊 Raw feature values"):
-    desc = {
-        "return_1d":     "Previous day's % return",
-        "MA_10":         "10-day moving average",
-        "MA_50":         "50-day moving average",
-        "volatility":    "Annualised 10-day volatility",
-        "volume_change": "Day-over-day volume change",
-        "RSI":           "14-period RSI",
+# ── Main layout: chart left, explanation right ────────────────────────────────
+left, right = st.columns([2.2, 1], gap="large")
+
+with left:
+    section_label("Price Chart — Last 90 Days")
+
+    chart_df = df.tail(90).copy()
+
+    # Convert index to numeric positions to avoid Plotly timestamp issues
+    # Use string dates for display but integer x-axis internally
+    dates_str = chart_df.index.strftime("%Y-%m-%d").tolist()
+    n         = len(dates_str)
+    x_idx     = list(range(n))
+
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True,
+        row_heights=[0.58, 0.22, 0.20],
+        vertical_spacing=0.03,
+    )
+
+    # ── Candlestick ───────────────────────────────────────────────────────────
+    fig.add_trace(go.Candlestick(
+        x=x_idx,
+        open=chart_df["Open"].values,
+        high=chart_df["High"].values,
+        low=chart_df["Low"].values,
+        close=chart_df["Close"].values,
+        name="Price",
+        increasing_line_color=GRN, decreasing_line_color=RED,
+        increasing_fillcolor=GRN,  decreasing_fillcolor=RED,
+    ), row=1, col=1)
+
+    # MA lines
+    fig.add_trace(go.Scatter(x=x_idx, y=chart_df["MA_10"].values,
+        line=dict(color=GOLD, width=1.2), name="MA10"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=x_idx, y=chart_df["MA_50"].values,
+        line=dict(color=OR2, width=1.2), name="MA50"), row=1, col=1)
+
+    # Bollinger Bands
+    if "BB_Up" in chart_df.columns and "BB_Lo" in chart_df.columns:
+        fig.add_trace(go.Scatter(x=x_idx, y=chart_df["BB_Up"].values,
+            line=dict(color=OR, width=0.8, dash="dot"),
+            name="BB Upper", opacity=0.5), row=1, col=1)
+        fig.add_trace(go.Scatter(x=x_idx, y=chart_df["BB_Lo"].values,
+            line=dict(color=OR, width=0.8, dash="dot"),
+            fill="tonexty", fillcolor="rgba(212,98,26,0.04)",
+            name="BB Lower", opacity=0.5), row=1, col=1)
+
+    # ── Signal marker: vertical line using add_shape (no annotation bug) ──────
+    last_x = n - 1
+    fig.add_shape(
+        type="line",
+        x0=last_x, x1=last_x,
+        y0=0, y1=1,
+        yref="paper",
+        line=dict(color=sig_color, width=2, dash="dash"),
+        row=1, col=1,
+    )
+    # Signal label as annotation separately — avoids the _mean() crash
+    fig.add_annotation(
+        x=last_x,
+        y=1.0,
+        yref="paper",
+        text=f"→ {sig_primary}",
+        showarrow=False,
+        font=dict(color=sig_color, size=12, family="JetBrains Mono"),
+        xanchor="left",
+        yanchor="top",
+        row=1, col=1,
+    )
+
+    # ── MACD ──────────────────────────────────────────────────────────────────
+    if "MACD_H" in chart_df.columns:
+        bar_c = [GRN if v >= 0 else RED
+                 for v in chart_df["MACD_H"].fillna(0).values]
+        fig.add_trace(go.Bar(x=x_idx, y=chart_df["MACD_H"].values,
+            marker_color=bar_c, opacity=0.65, name="MACD Hist",
+            showlegend=False), row=2, col=1)
+        fig.add_trace(go.Scatter(x=x_idx, y=chart_df["MACD"].values,
+            line=dict(color=OR, width=1.1), name="MACD",
+            showlegend=False), row=2, col=1)
+        fig.add_trace(go.Scatter(x=x_idx, y=chart_df["MACD_Sig"].values,
+            line=dict(color=CREAM, width=1, dash="dot"),
+            opacity=0.7, name="Signal",
+            showlegend=False), row=2, col=1)
+
+    # ── RSI — use scatter lines instead of add_hline ──────────────────────────
+    fig.add_trace(go.Scatter(x=x_idx, y=chart_df["RSI"].values,
+        line=dict(color=GOLD, width=1.3), name="RSI",
+        showlegend=False), row=3, col=1)
+
+    # Overbought/oversold as scatter lines (safer than add_hline on subplots)
+    for lvl, clr in [(70, RED), (30, GRN)]:
+        fig.add_trace(go.Scatter(
+            x=[0, n-1], y=[lvl, lvl], mode="lines",
+            line=dict(color=clr, width=0.8, dash="dot"),
+            showlegend=False,
+        ), row=3, col=1)
+
+    fig.add_hrect(y0=70, y1=100,
+                  fillcolor="rgba(217,95,75,0.04)", line_width=0,
+                  row=3, col=1)
+    fig.add_hrect(y0=0, y1=30,
+                  fillcolor="rgba(82,183,136,0.04)", line_width=0,
+                  row=3, col=1)
+
+    # ── X-axis: show date labels at sensible intervals ─────────────────────────
+    tick_step  = max(1, n // 8)
+    tick_vals  = list(range(0, n, tick_step))
+    tick_texts = [dates_str[i] for i in tick_vals]
+
+    layout = base_layout("", h=560)
+    layout["xaxis_rangeslider_visible"]  = False
+    layout["xaxis3_rangeslider_visible"] = False
+    fig.update_layout(**layout)
+
+    for row_i in (1, 2, 3):
+        fig.update_xaxes(
+            tickvals=tick_vals, ticktext=tick_texts,
+            tickangle=0, tickfont=dict(size=9),
+            gridcolor="rgba(180,80,20,0.07)",
+            linecolor="rgba(180,80,20,0.15)",
+            row=row_i, col=1,
+        )
+        fig.update_yaxes(
+            gridcolor="rgba(180,80,20,0.07)",
+            linecolor="rgba(180,80,20,0.15)",
+            tickfont=dict(size=9),
+            row=row_i, col=1,
+        )
+
+    fig.update_xaxes(rangeslider_visible=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── SHAP feature contributions ────────────────────────────────────────────
+    section_label("Explainable AI — SHAP Feature Contributions")
+    shap_done = False
+    try:
+        import shap
+        clf_shap = primary_clf
+
+        if primary_key == "logistic_regression":
+            explainer = shap.LinearExplainer(clf_shap, X_live)
+        else:
+            explainer = shap.TreeExplainer(clf_shap)
+
+        sv = explainer.shap_values(X_live)
+        if isinstance(sv, list):
+            sv = sv[1]
+        sv = np.array(sv).flatten()
+
+        shap_s = pd.Series(sv, index=FEATURE_COLS).sort_values()
+        colors_shap = [GRN if v > 0 else RED for v in shap_s.values]
+
+        fig_sh = go.Figure(go.Bar(
+            x=shap_s.values, y=shap_s.index, orientation="h",
+            marker=dict(color=colors_shap),
+            text=[f"{v:+.4f}" for v in shap_s.values],
+            textposition="outside",
+            textfont=dict(color=MUTE, size=9, family="JetBrains Mono"),
+        ))
+        fig_sh.update_layout(**base_layout("", h=280))
+        fig_sh.add_shape(type="line", x0=0, x1=0, y0=-0.5,
+                         y1=len(FEATURE_COLS)-0.5,
+                         line=dict(color=MUTE, width=1))
+        fig_sh.update_xaxes(title_text="← SELL influence    |    BUY influence →",
+                             title_font=dict(size=10))
+        st.plotly_chart(fig_sh, use_container_width=True)
+
+        st.markdown(f"""
+        <div style="font-size:0.76rem;color:{MUTE};line-height:1.8;
+                    padding:0.7rem 1rem;background:rgba(28,16,8,0.5);
+                    border-radius:8px;border-left:3px solid {OR}">
+          <span style="color:{GRN}">■ Green bars</span> pushed today's prediction toward
+          <b style="color:{GRN}">BUY</b> &nbsp;·&nbsp;
+          <span style="color:{RED}">■ Red bars</span> pushed toward
+          <b style="color:{RED}">SELL</b> &nbsp;·&nbsp;
+          Bar length = magnitude of that feature's influence.
+        </div>
+        """, unsafe_allow_html=True)
+        shap_done = True
+
+    except ImportError:
+        st.info("Add `shap` to requirements.txt to enable SHAP explanations.")
+    except Exception as e:
+        st.warning(f"SHAP unavailable: {e}")
+
+    if not shap_done:
+        # Fallback: show normalised feature values
+        section_label("Feature Contributions (SHAP unavailable)")
+        norm = {k: v / (abs(v) + 1e-9) for k, v in features.items()}
+        norm_s = pd.Series(norm).sort_values()
+        fig_fb = go.Figure(go.Bar(
+            x=norm_s.values, y=norm_s.index, orientation="h",
+            marker_color=[GRN if v > 0 else RED for v in norm_s.values],
+            text=[f"{v:+.3f}" for v in norm_s.values],
+            textposition="outside",
+            textfont=dict(color=MUTE, size=9, family="JetBrains Mono"),
+        ))
+        fig_fb.update_layout(**base_layout("", h=260))
+        st.plotly_chart(fig_fb, use_container_width=True)
+
+with right:
+    # ── Confidence gauge ──────────────────────────────────────────────────────
+    section_label("Signal Confidence")
+    conf_pct = prob_primary * 100
+    glass_card(f"""
+      <div style="text-align:center;padding:0.5rem 0">
+        <div style="font-family:'Playfair Display',serif;font-size:2.8rem;
+                    font-weight:700;color:{sig_color};line-height:1">
+          {conf_pct:.1f}%
+        </div>
+        <div style="font-size:0.72rem;color:{MUTE};margin:0.3rem 0 1rem">
+          probability of upward move
+        </div>
+        <div style="background:rgba(58,36,24,0.5);border-radius:6px;
+                    height:12px;overflow:hidden;position:relative;margin-bottom:0.4rem">
+          <div style="position:absolute;left:50%;top:0;bottom:0;
+                      width:2px;background:{MUTE};transform:translateX(-50%)"></div>
+          <div style="height:100%;width:{abs(conf_pct-50)*2:.0f}%;
+                      background:{sig_color};border-radius:6px;
+                      margin-left:{'50%' if conf_pct>50 else str(conf_pct)+'%'}">
+          </div>
+        </div>
+        <div style="display:flex;justify-content:space-between;
+                    font-size:0.6rem;color:{MUTE}">
+          <span>SELL ◄</span><span>NEUTRAL</span><span>► BUY</span>
+        </div>
+      </div>
+    """)
+
+    # ── AI reasoning ─────────────────────────────────────────────────────────
+    section_label("AI Decision Reasoning")
+    reasons = explain_signal_text(latest, sig_primary, prob_primary)
+    SENT_COLOR = {"bullish": GRN, "bearish": RED, "neutral": MUTE}
+    SENT_ICON  = {"bullish": "▲", "bearish": "▼", "neutral": "●"}
+
+    for reason_text, sentiment in reasons:
+        sc2 = SENT_COLOR.get(sentiment, MUTE)
+        si  = SENT_ICON.get(sentiment, "●")
+        st.markdown(f"""
+        <div style="display:flex;gap:0.5rem;align-items:flex-start;
+                    padding:0.5rem 0.8rem;margin-bottom:0.4rem;
+                    background:rgba(28,16,8,0.65);border-radius:8px;
+                    border-left:3px solid {sc2}">
+          <span style="color:{sc2};font-size:0.72rem;
+                       margin-top:0.15rem;flex-shrink:0">{si}</span>
+          <span style="font-size:0.74rem;color:{CREAM};
+                       font-family:'Outfit',sans-serif;line-height:1.6">
+            {reason_text}
+          </span>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── Features used ─────────────────────────────────────────────────────────
+    section_label("Features Fed to Model")
+    feat_meta = {
+        "return_1d":     ("1-day return",       "pct"),
+        "MA_10":         ("MA (10-day)",         "price"),
+        "MA_50":         ("MA (50-day)",         "price"),
+        "volatility":    ("Volatility (10d)",    "pct"),
+        "volume_change": ("Volume change",       "pct"),
+        "RSI":           ("RSI (14)",            "rsi"),
     }
-    st.dataframe(pd.DataFrame([{
-        "Feature": k, "Value": round(v, 6), "Description": desc.get(k, "")
-    } for k, v in features.items()]), hide_index=True, use_container_width=True)
+    rows_html = ""
+    for col, (label, fmt) in feat_meta.items():
+        val = features[col]
+        if fmt == "pct":
+            display = f"{val*100:+.3f}%"
+            color   = GRN if val > 0 else RED
+        elif fmt == "rsi":
+            display = f"{val:.2f}"
+            color   = RED if val > 70 else (GRN if val < 30 else CREAM)
+        else:
+            display = f"{val:.4f}"
+            color   = CREAM
+        rows_html += kv(label, display, color)
+    glass_card(rows_html, small=True)
 
-st.caption(
-    f"Data as of {df.index[-1].strftime('%d %b %Y') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])[:10]} · "
-    f"Source: Yahoo Finance · Model: {engine_name} · Not financial advice."
-)
+    # ── Data info ─────────────────────────────────────────────────────────────
+    section_label("Data Info")
+    last_date = df.index[-1]
+    date_disp = last_date.strftime("%Y-%m-%d") if hasattr(last_date, "strftime") \
+                else str(last_date)[:10]
+    glass_card(f"""
+      {kv('Data as of',     date_disp,                              OR2)}
+      {kv('Data points',    f"{len(df):,}",                         CREAM)}
+      {kv('Source',         'Yahoo Finance (live)',                 GRN)}
+      {kv('Model',          model.replace('_',' ').title(),        GOLD)}
+      {kv('Retraining',     'Not required — using saved .pkl',     CREAM)}
+    """, small=True)

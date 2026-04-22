@@ -1,7 +1,6 @@
 """
 data/live_feed.py
-The timezone strip MUST happen before dropna.
-Debug confirmed: tz=America/New_York causes index misalignment → rows silently dropped.
+Fetches live Yahoo Finance data, computes features for prediction.
 """
 
 import numpy as np
@@ -27,16 +26,14 @@ def get_latest_data(ticker: str) -> pd.DataFrame:
     if raw is None or raw.empty:
         raise ValueError(f"Yahoo Finance returned 0 rows for '{ticker}'.")
 
-    # Flatten MultiIndex
+    # Flatten MultiIndex if present
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = [col[0] for col in raw.columns]
 
-    # ── CRITICAL: strip timezone BEFORE any other operation ──
-    # Debug confirmed tz=America/New_York. tz_localize(None) removes it cleanly.
+    # Strip timezone — MUST happen before any other operation
     try:
         raw.index = raw.index.tz_localize(None)
     except TypeError:
-        # Already tz-naive, or tz-aware — convert then remove
         raw.index = raw.index.tz_convert("UTC").tz_localize(None)
 
     raw.index = pd.to_datetime(raw.index)
@@ -52,11 +49,11 @@ def get_latest_data(ticker: str) -> pd.DataFrame:
         elif cl == "volume": col_map[c] = "Volume"
     raw = raw.rename(columns=col_map)
 
-    keep = [c for c in ["Open","High","Low","Close","Volume"] if c in raw.columns]
-    raw  = raw[keep].copy()
-    if "Volume" not in raw.columns:
-        raw["Volume"] = 0.0
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if col not in raw.columns:
+            raw[col] = 0.0
 
+    raw = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
     raw = raw.apply(pd.to_numeric, errors="coerce")
     raw = raw[~raw.index.duplicated(keep="last")]
     raw = raw.sort_index().dropna(subset=["Close"])
@@ -78,7 +75,7 @@ def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
     loss  = (-delta.clip(upper=0)).rolling(14).mean()
     df["RSI"] = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
 
-    # Chart indicators (NOT in dropna)
+    # Extra chart indicators (not required for model, so not in dropna)
     df["MA_20"]    = df["Close"].rolling(20).mean()
     df["MA_200"]   = df["Close"].rolling(200).mean()
     df["BB_Mid"]   = df["Close"].rolling(20).mean()
@@ -90,8 +87,9 @@ def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df["MACD"]     = e12 - e26
     df["MACD_Sig"] = df["MACD"].ewm(span=9, adjust=False).mean()
     df["MACD_H"]   = df["MACD"] - df["MACD_Sig"]
+    df["Vol_20"]   = df["return_1d"].rolling(20).std() * np.sqrt(252)
 
-    # Drop only on model features
+    # Only drop rows where model features are NaN
     df = df.dropna(subset=FEATURE_COLS)
     return df
 
@@ -108,7 +106,8 @@ def get_prediction_row(ticker: str) -> dict:
     latest     = df.iloc[-1]
     prev_close = df.iloc[-2]["Close"]
 
-    missing = [c for c in FEATURE_COLS if c not in df.columns or pd.isna(latest[c])]
+    missing = [c for c in FEATURE_COLS
+               if c not in df.columns or pd.isna(latest[c])]
     if missing:
         raise ValueError(f"Features NaN for '{ticker}': {missing}")
 
@@ -145,12 +144,17 @@ def explain_signal_text(latest: pd.Series, signal: str, prob: float) -> list:
     else:
         reasons.append((f"MACD ({macd:.3f}) below signal ({macd_s:.3f}) — bearish crossover.", "bearish"))
 
-    reasons.append((f"Price ${close:.2f} {'above' if close > ma50 else 'below'} MA50 ${ma50:.2f} — "
-                    f"{'uptrend intact' if close > ma50 else 'downtrend'}.", "bullish" if close > ma50 else "bearish"))
+    reasons.append((
+        f"Price ${close:.2f} {'above' if close > ma50 else 'below'} MA50 ${ma50:.2f} — "
+        f"{'uptrend intact' if close > ma50 else 'downtrend'}.",
+        "bullish" if close > ma50 else "bearish"
+    ))
 
-    reasons.append((f"MA10 ${ma10:.2f} {'>' if ma10 > ma50 else '<'} MA50 ${ma50:.2f} — "
-                    f"{'Golden Cross zone' if ma10 > ma50 else 'Death Cross zone'}.",
-                    "bullish" if ma10 > ma50 else "bearish"))
+    reasons.append((
+        f"MA10 ${ma10:.2f} {'>' if ma10 > ma50 else '<'} MA50 ${ma50:.2f} — "
+        f"{'Golden Cross zone' if ma10 > ma50 else 'Death Cross zone'}.",
+        "bullish" if ma10 > ma50 else "bearish"
+    ))
 
     if not (np.isnan(bb_up) or np.isnan(bb_lo)) and (bb_up - bb_lo) > 0:
         bb_pct = (close - bb_lo) / (bb_up - bb_lo) * 100
