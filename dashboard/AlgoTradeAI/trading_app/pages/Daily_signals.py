@@ -1,7 +1,7 @@
 """
 pages/Daily_Signal.py  —  AlgoTrade · Daily Signal
-Bulletproof import: walks up from __file__ until it finds data/live_feed.py,
-then loads it directly with importlib — works on any folder structure.
+Fix: add_vline x= must be a string not a pandas Timestamp.
+Fix: add_hline had wrong col=3 (should be col=1).
 """
 
 import sys, os, importlib, importlib.util
@@ -13,17 +13,14 @@ import streamlit as st
 import joblib
 from datetime import datetime, timedelta
 
+
 # ══════════════════════════════════════════════════════════
-# PATH RESOLUTION — finds data/live_feed.py by walking UP
-# from this file's location until found.
-# Works on local, Docker, and Streamlit Cloud.
+# PATH RESOLUTION
 # ══════════════════════════════════════════════════════════
 def _find_project_root() -> str:
-    """Walk up the directory tree until we find a folder containing data/live_feed.py"""
     current = os.path.dirname(os.path.abspath(__file__))
-    for _ in range(10):  # max 10 levels up
-        candidate = os.path.join(current, "data", "live_feed.py")
-        if os.path.exists(candidate):
+    for _ in range(10):
+        if os.path.exists(os.path.join(current, "data", "live_feed.py")):
             return current
         parent = os.path.dirname(current)
         if parent == current:
@@ -31,26 +28,23 @@ def _find_project_root() -> str:
         current = parent
     raise FileNotFoundError(
         "Could not find data/live_feed.py by walking up from:\n"
-        f"{os.path.dirname(os.path.abspath(__file__))}\n"
-        "Make sure live_feed.py is inside a 'data/' folder in your project root."
+        f"{os.path.dirname(os.path.abspath(__file__))}"
     )
 
 try:
     PROJECT_ROOT = _find_project_root()
-except FileNotFoundError as _root_err:
+except FileNotFoundError as _e:
     st.set_page_config(page_title="Daily Signal · AlgoTrade", layout="wide")
-    st.error(f"Setup error: {_root_err}")
+    st.error(str(_e))
     st.stop()
 
-# Add project root to sys.path so normal imports work too
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# Load live_feed directly from its absolute path — bypasses all import cache issues
 _lf_path = os.path.join(PROJECT_ROOT, "data", "live_feed.py")
 _spec     = importlib.util.spec_from_file_location("live_feed", _lf_path)
 _lf       = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_lf)   # always executes fresh — no cache
+_spec.loader.exec_module(_lf)
 
 get_prediction_row  = _lf.get_prediction_row
 explain_signal_text = _lf.explain_signal_text
@@ -131,9 +125,15 @@ def make_shap_fig(model, features, name):
 
 def make_price_fig(df, signal):
     df90 = df.tail(90).copy()
-    fig  = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                         row_heights=[0.58, 0.22, 0.20], vertical_spacing=0.03)
 
+    # ── Convert index to string so Plotly doesn't try to do Timestamp arithmetic ──
+    last_date_str = df90.index[-1].strftime("%Y-%m-%d")
+    df90.index    = df90.index.strftime("%Y-%m-%d")
+
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                        row_heights=[0.58, 0.22, 0.20], vertical_spacing=0.03)
+
+    # Candlestick
     fig.add_trace(go.Candlestick(
         x=df90.index, open=df90["Open"], high=df90["High"],
         low=df90["Low"], close=df90["Close"],
@@ -141,25 +141,34 @@ def make_price_fig(df, signal):
         name="Price",
     ), row=1, col=1)
 
+    # Moving averages
     for col, color, lname in [("MA_10","#E8A838","MA10"), ("MA_50","#5B9BD5","MA50")]:
         if col in df90:
-            fig.add_trace(go.Scatter(x=df90.index, y=df90[col],
-                line=dict(color=color, width=1.2), name=lname), row=1, col=1)
+            fig.add_trace(go.Scatter(
+                x=df90.index, y=df90[col],
+                line=dict(color=color, width=1.2), name=lname,
+            ), row=1, col=1)
 
+    # Bollinger Bands
     if "BB_Up" in df90:
         fig.add_trace(go.Scatter(x=df90.index, y=df90["BB_Up"],
             line=dict(color="#666", width=0.8, dash="dot"),
-            name="BB", showlegend=False), row=1, col=1)
+            name="BB Up", showlegend=False), row=1, col=1)
         fig.add_trace(go.Scatter(x=df90.index, y=df90["BB_Lo"],
             line=dict(color="#666", width=0.8, dash="dot"),
             fill="tonexty", fillcolor="rgba(130,130,130,0.07)",
             name="BB Lo", showlegend=False), row=1, col=1)
 
-    fig.add_vline(x=df90.index[-1], line_color=SIG_COLOR[signal],
-                  line_width=2, line_dash="dash",
-                  annotation_text=f"  {signal}",
-                  annotation_font_color=SIG_COLOR[signal], annotation_font_size=13)
+    # ── Signal line: x= must be a STRING not a Timestamp ──
+    fig.add_vline(
+        x=last_date_str,
+        line_color=SIG_COLOR[signal], line_width=2, line_dash="dash",
+        annotation_text=f"  {signal}",
+        annotation_font_color=SIG_COLOR[signal],
+        annotation_font_size=13,
+    )
 
+    # MACD
     if "MACD" in df90:
         bar_c = ["#1D9E75" if v >= 0 else "#E24B4A" for v in df90["MACD_H"].fillna(0)]
         fig.add_trace(go.Bar(x=df90.index, y=df90["MACD_H"],
@@ -167,14 +176,21 @@ def make_price_fig(df, signal):
         fig.add_trace(go.Scatter(x=df90.index, y=df90["MACD"],
             line=dict(color="#E8A838", width=1), name="MACD"), row=2, col=1)
         fig.add_trace(go.Scatter(x=df90.index, y=df90["MACD_Sig"],
-            line=dict(color="#5B9BD5", width=1, dash="dot"), name="Sig"), row=2, col=1)
+            line=dict(color="#5B9BD5", width=1, dash="dot"), name="Signal"), row=2, col=1)
 
+    # RSI — use shapes instead of add_hline to avoid subplot targeting issues
     if "RSI" in df90:
         fig.add_trace(go.Scatter(x=df90.index, y=df90["RSI"],
             line=dict(color="#E8A838", width=1.2), name="RSI"), row=3, col=1)
-        for lvl, clr in [(70, "#E24B4A55"), (30, "#1D9E7555")]:
-            fig.add_hline(y=lvl, line_color=clr, line_dash="dot",
-                          line_width=1, row=3, col=1)
+        # Draw overbought/oversold as scatter lines (safer than add_hline on subplots)
+        for lvl, clr in [(70, "#E24B4A"), (30, "#1D9E75")]:
+            fig.add_trace(go.Scatter(
+                x=[df90.index[0], df90.index[-1]],
+                y=[lvl, lvl],
+                mode="lines",
+                line=dict(color=clr, width=0.8, dash="dot"),
+                showlegend=False,
+            ), row=3, col=1)
 
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
@@ -186,6 +202,7 @@ def make_price_fig(df, signal):
     for r in (1, 2, 3):
         fig.update_xaxes(gridcolor="#2a2a2a", row=r, col=1)
         fig.update_yaxes(gridcolor="#2a2a2a", row=r, col=1)
+
     return fig
 
 
@@ -221,7 +238,7 @@ st.markdown(
 if not models:
     st.error(
         f"No trained models found. Looked in: {PROJECT_ROOT}/models/\n"
-        "Make sure xgb_model.pkl, rf_model.pkl, lr_model.pkl are committed to your repo."
+        "Commit xgb_model.pkl, rf_model.pkl, lr_model.pkl to your repo."
     )
     st.stop()
 
@@ -233,10 +250,8 @@ with st.spinner(f"Fetching 2 years of {ticker} data from Yahoo Finance…"):
         data = get_prediction_row(ticker)
     except Exception as err:
         st.error(f"Could not fetch live data: {err}")
-
         with st.expander("🔍 Debug details"):
-            st.write("**Project root found at:**", PROJECT_ROOT)
-            st.write("**live_feed.py path:**", _lf_path)
+            st.write("**Project root:**", PROJECT_ROOT)
             st.write("**live_feed.py exists:**", os.path.exists(_lf_path))
             try:
                 import yfinance as yf
@@ -259,12 +274,12 @@ with st.spinner(f"Fetching 2 years of {ticker} data from Yahoo Finance…"):
                     d = raw["Close"].diff()
                     g = d.clip(lower=0).rolling(14).mean()
                     l = (-d.clip(upper=0)).rolling(14).mean()
-                    raw["RSI"] = 100 - (100/(1 + g/l.replace(0, float("nan"))))
+                    raw["RSI"] = 100-(100/(1+g/l.replace(0, float("nan"))))
                     clean = raw.dropna(subset=FEATURE_COLS)
                     st.write(f"After dropna: {len(clean)} rows")
                     st.dataframe(clean[FEATURE_COLS].tail(3))
             except Exception as e2:
-                st.error(f"Debug fetch failed: {e2}")
+                st.error(f"Debug failed: {e2}")
         st.stop()
 
 # ══════════════════════════════════════════════════════════
@@ -286,7 +301,7 @@ sig_col      = SIG_COLOR[signal]
 arrow        = "▲" if pct_chg >= 0 else "▼"
 pchg_col     = "#1D9E75" if pct_chg >= 0 else "#E24B4A"
 
-# Big signal card
+# Signal card
 st.markdown(f"""
 <div style="background:#111;border:1px solid {sig_col}55;border-radius:16px;
             padding:2rem 2.5rem;margin:1rem 0 1.5rem;
@@ -387,6 +402,6 @@ with st.expander("📊 Raw feature values"):
     } for k, v in features.items()]), hide_index=True, use_container_width=True)
 
 st.caption(
-    f"Data as of {df.index[-1].strftime('%d %b %Y')} · "
+    f"Data as of {df.index[-1].strftime('%d %b %Y') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])[:10]} · "
     f"Source: Yahoo Finance · Model: {engine_name} · Not financial advice."
 )
