@@ -1,9 +1,10 @@
 """
 pages/Daily_Signal.py  —  AlgoTrade · Daily Signal
-Uses importlib.reload(live_feed) to bypass Streamlit module cache.
+Bulletproof import: walks up from __file__ until it finds data/live_feed.py,
+then loads it directly with importlib — works on any folder structure.
 """
 
-import sys, os, importlib
+import sys, os, importlib, importlib.util
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -12,15 +13,48 @@ import streamlit as st
 import joblib
 from datetime import datetime, timedelta
 
-# ── Force-add project root so 'data.live_feed' always resolves ──
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+# ══════════════════════════════════════════════════════════
+# PATH RESOLUTION — finds data/live_feed.py by walking UP
+# from this file's location until found.
+# Works on local, Docker, and Streamlit Cloud.
+# ══════════════════════════════════════════════════════════
+def _find_project_root() -> str:
+    """Walk up the directory tree until we find a folder containing data/live_feed.py"""
+    current = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(10):  # max 10 levels up
+        candidate = os.path.join(current, "data", "live_feed.py")
+        if os.path.exists(candidate):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    raise FileNotFoundError(
+        "Could not find data/live_feed.py by walking up from:\n"
+        f"{os.path.dirname(os.path.abspath(__file__))}\n"
+        "Make sure live_feed.py is inside a 'data/' folder in your project root."
+    )
 
-# ── Force reload live_feed every time to bypass Streamlit's module cache ──
-import data.live_feed as _lf_module
-importlib.reload(_lf_module)
-from data.live_feed import get_prediction_row, explain_signal_text, FEATURE_COLS
+try:
+    PROJECT_ROOT = _find_project_root()
+except FileNotFoundError as _root_err:
+    st.set_page_config(page_title="Daily Signal · AlgoTrade", layout="wide")
+    st.error(f"Setup error: {_root_err}")
+    st.stop()
+
+# Add project root to sys.path so normal imports work too
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# Load live_feed directly from its absolute path — bypasses all import cache issues
+_lf_path = os.path.join(PROJECT_ROOT, "data", "live_feed.py")
+_spec     = importlib.util.spec_from_file_location("live_feed", _lf_path)
+_lf       = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_lf)   # always executes fresh — no cache
+
+get_prediction_row  = _lf.get_prediction_row
+explain_signal_text = _lf.explain_signal_text
+FEATURE_COLS        = _lf.FEATURE_COLS
 
 # ══════════════════════════════════════════════════════════
 st.set_page_config(page_title="Daily Signal · AlgoTrade", layout="wide")
@@ -52,8 +86,9 @@ SENT_BG   = {"bullish": "#0F6E56", "bearish": "#A32D2D", "neutral": "#3a3a3a"}
 def load_models():
     out = {}
     for name, path in MODEL_PATHS.items():
+        full = os.path.join(PROJECT_ROOT, path)
         try:
-            out[name] = joblib.load(path)
+            out[name] = joblib.load(full)
         except Exception:
             pass
     return out
@@ -108,10 +143,8 @@ def make_price_fig(df, signal):
 
     for col, color, lname in [("MA_10","#E8A838","MA10"), ("MA_50","#5B9BD5","MA50")]:
         if col in df90:
-            fig.add_trace(go.Scatter(
-                x=df90.index, y=df90[col],
-                line=dict(color=color, width=1.2), name=lname,
-            ), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df90.index, y=df90[col],
+                line=dict(color=color, width=1.2), name=lname), row=1, col=1)
 
     if "BB_Up" in df90:
         fig.add_trace(go.Scatter(x=df90.index, y=df90["BB_Up"],
@@ -125,12 +158,10 @@ def make_price_fig(df, signal):
     fig.add_vline(x=df90.index[-1], line_color=SIG_COLOR[signal],
                   line_width=2, line_dash="dash",
                   annotation_text=f"  {signal}",
-                  annotation_font_color=SIG_COLOR[signal],
-                  annotation_font_size=13)
+                  annotation_font_color=SIG_COLOR[signal], annotation_font_size=13)
 
     if "MACD" in df90:
-        bar_c = ["#1D9E75" if v >= 0 else "#E24B4A"
-                 for v in df90["MACD_H"].fillna(0)]
+        bar_c = ["#1D9E75" if v >= 0 else "#E24B4A" for v in df90["MACD_H"].fillna(0)]
         fig.add_trace(go.Bar(x=df90.index, y=df90["MACD_H"],
             marker_color=bar_c, name="MACD Hist"), row=2, col=1)
         fig.add_trace(go.Scatter(x=df90.index, y=df90["MACD"],
@@ -188,52 +219,52 @@ st.markdown(
 )
 
 if not models:
-    st.error("No trained models found in models/ folder.")
+    st.error(
+        f"No trained models found. Looked in: {PROJECT_ROOT}/models/\n"
+        "Make sure xgb_model.pkl, rf_model.pkl, lr_model.pkl are committed to your repo."
+    )
     st.stop()
 
 # ══════════════════════════════════════════════════════════
-#  FETCH & PREDICT
+#  FETCH
 # ══════════════════════════════════════════════════════════
-with st.spinner(f"Fetching 2 years of {ticker} data…"):
+with st.spinner(f"Fetching 2 years of {ticker} data from Yahoo Finance…"):
     try:
         data = get_prediction_row(ticker)
     except Exception as err:
         st.error(f"Could not fetch live data: {err}")
 
         with st.expander("🔍 Debug details"):
+            st.write("**Project root found at:**", PROJECT_ROOT)
+            st.write("**live_feed.py path:**", _lf_path)
+            st.write("**live_feed.py exists:**", os.path.exists(_lf_path))
             try:
                 import yfinance as yf
                 today = datetime.today().date()
-                start = today - timedelta(days=730)
-                end   = today + timedelta(days=1)
-                t     = yf.Ticker(ticker)
-                raw   = t.history(start=str(start), end=str(end),
-                                  auto_adjust=True, actions=False)
-                st.write(f"Rows: {len(raw)} | tz: {getattr(raw.index,'tz','none')}")
-                st.write("Columns:", list(raw.columns))
+                t   = yf.Ticker(ticker)
+                raw = t.history(start=str(today - timedelta(days=730)),
+                                end=str(today + timedelta(days=1)),
+                                auto_adjust=True, actions=False)
+                st.write(f"Raw rows: {len(raw)} | tz: {getattr(raw.index,'tz','none')}")
                 if not raw.empty:
-                    # Strip tz
                     try:
                         raw.index = raw.index.tz_localize(None)
                     except TypeError:
                         raw.index = raw.index.tz_convert("UTC").tz_localize(None)
-                    raw["return_1d"]  = raw["Close"].pct_change()
-                    raw["MA_10"]      = raw["Close"].rolling(10).mean()
-                    raw["MA_50"]      = raw["Close"].rolling(50).mean()
-                    raw["volatility"] = raw["return_1d"].rolling(10).std() * (252**0.5)
+                    raw["return_1d"]     = raw["Close"].pct_change()
+                    raw["MA_10"]         = raw["Close"].rolling(10).mean()
+                    raw["MA_50"]         = raw["Close"].rolling(50).mean()
+                    raw["volatility"]    = raw["return_1d"].rolling(10).std() * (252**0.5)
                     raw["volume_change"] = raw["Volume"].pct_change()
                     d = raw["Close"].diff()
                     g = d.clip(lower=0).rolling(14).mean()
                     l = (-d.clip(upper=0)).rolling(14).mean()
-                    raw["RSI"] = 100 - (100 / (1 + g / l.replace(0, float("nan"))))
-                    before = len(raw)
-                    clean  = raw.dropna(subset=FEATURE_COLS)
-                    st.write(f"Before dropna: {before} | After: {len(clean)}")
+                    raw["RSI"] = 100 - (100/(1 + g/l.replace(0, float("nan"))))
+                    clean = raw.dropna(subset=FEATURE_COLS)
+                    st.write(f"After dropna: {len(clean)} rows")
                     st.dataframe(clean[FEATURE_COLS].tail(3))
             except Exception as e2:
-                st.error(f"Debug failed: {e2}")
-
-        st.info("Try refreshing. If this persists, check that live_feed.py was saved correctly.")
+                st.error(f"Debug fetch failed: {e2}")
         st.stop()
 
 # ══════════════════════════════════════════════════════════
@@ -255,7 +286,7 @@ sig_col      = SIG_COLOR[signal]
 arrow        = "▲" if pct_chg >= 0 else "▼"
 pchg_col     = "#1D9E75" if pct_chg >= 0 else "#E24B4A"
 
-# Signal card
+# Big signal card
 st.markdown(f"""
 <div style="background:#111;border:1px solid {sig_col}55;border-radius:16px;
             padding:2rem 2.5rem;margin:1rem 0 1.5rem;
@@ -327,7 +358,7 @@ with right:
 
 st.markdown("---")
 
-# Text reasoning
+# Reasoning
 st.markdown("#### Why this signal? — AI reasoning")
 reasons = explain_signal_text(latest, signal, prob)
 rc = st.columns(2)
@@ -335,8 +366,8 @@ for i, (text, sentiment) in enumerate(reasons):
     bg = SENT_BG.get(sentiment, "#333")
     rc[i % 2].markdown(f"""
     <div style="background:{bg}33;border-left:3px solid {bg};border-radius:8px;
-                padding:.55rem .85rem;margin-bottom:8px;
-                font-size:13px;color:#ccc;line-height:1.5">
+                padding:.55rem .85rem;margin-bottom:8px;font-size:13px;
+                color:#ccc;line-height:1.5">
       {SENT_ICON.get(sentiment,'')} {text}
     </div>""", unsafe_allow_html=True)
 
