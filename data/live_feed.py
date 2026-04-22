@@ -1,8 +1,7 @@
 """
-data/live_feed.py  —  AlgoTrade Daily Signal
-Uses explicit start/end dates (NOT period strings like '18mo') — more reliable on Streamlit Cloud.
-Debug screenshot showed: 124 rows with "6mo" period, timezone 00:00:00-04:00 not stripped.
-This version fetches 730 days explicitly → ~500 trading days → plenty for MA_50 + RSI warmup.
+data/live_feed.py
+The timezone strip MUST happen before dropna.
+Debug confirmed: tz=America/New_York causes index misalignment → rows silently dropped.
 """
 
 import numpy as np
@@ -14,43 +13,35 @@ FEATURE_COLS = ["return_1d", "MA_10", "MA_50", "volatility", "volume_change", "R
 
 
 def get_latest_data(ticker: str) -> pd.DataFrame:
-    """
-    Fetch 2 years of data via explicit start/end dates.
-    730 calendar days ≈ 500+ trading days — MA_50 warmup needs 50, RSI needs 14.
-    After dropna we still have 430+ clean rows. No risk of running out.
-    """
     today = datetime.today().date()
     start = today - timedelta(days=730)
-    end   = today + timedelta(days=1)   # +1 so today is included if market has closed
+    end   = today + timedelta(days=1)
 
     t = yf.Ticker(ticker)
-
     try:
-        raw = t.history(
-            start=str(start),
-            end=str(end),
-            auto_adjust=True,
-            actions=False,
-        )
+        raw = t.history(start=str(start), end=str(end),
+                        auto_adjust=True, actions=False)
     except Exception as e:
         raise ConnectionError(f"Yahoo Finance fetch failed for '{ticker}': {e}")
 
     if raw is None or raw.empty:
-        raise ValueError(
-            f"Yahoo Finance returned 0 rows for '{ticker}'. "
-            "Check ticker symbol and internet connection."
-        )
+        raise ValueError(f"Yahoo Finance returned 0 rows for '{ticker}'.")
 
-    # ── Flatten MultiIndex columns (yfinance >= 0.2 sometimes wraps in ticker level) ──
+    # Flatten MultiIndex
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = [col[0] for col in raw.columns]
 
-    # ── Strip timezone — THIS was the silent bug (index showed 00:00:00-04:00) ──
-    if hasattr(raw.index, "tz") and raw.index.tz is not None:
+    # ── CRITICAL: strip timezone BEFORE any other operation ──
+    # Debug confirmed tz=America/New_York. tz_localize(None) removes it cleanly.
+    try:
+        raw.index = raw.index.tz_localize(None)
+    except TypeError:
+        # Already tz-naive, or tz-aware — convert then remove
         raw.index = raw.index.tz_convert("UTC").tz_localize(None)
+
     raw.index = pd.to_datetime(raw.index)
 
-    # ── Normalise column names to Title case ──
+    # Normalise column names
     col_map = {}
     for c in raw.columns:
         cl = c.strip().lower()
@@ -61,9 +52,8 @@ def get_latest_data(ticker: str) -> pd.DataFrame:
         elif cl == "volume": col_map[c] = "Volume"
     raw = raw.rename(columns=col_map)
 
-    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in raw.columns]
+    keep = [c for c in ["Open","High","Low","Close","Volume"] if c in raw.columns]
     raw  = raw[keep].copy()
-
     if "Volume" not in raw.columns:
         raw["Volume"] = 0.0
 
@@ -71,30 +61,12 @@ def get_latest_data(ticker: str) -> pd.DataFrame:
     raw = raw[~raw.index.duplicated(keep="last")]
     raw = raw.sort_index().dropna(subset=["Close"])
 
-    n_raw = len(raw)
-    if n_raw < 60:
-        raise ValueError(
-            f"Only {n_raw} trading days for '{ticker}' after cleaning. "
-            "Need at least 60."
-        )
-
-    df = _compute_features(raw)
-
-    n_after = len(df)
-    if n_after < 2:
-        raise ValueError(
-            f"Not enough data for {ticker} after feature computation. "
-            f"Raw rows: {n_raw}, after dropna: {n_after}. "
-            "This should not happen with 730-day fetch — check for data gaps."
-        )
-
-    return df
+    return _compute_features(raw)
 
 
 def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # ── Model features — identical to training pipeline ──
     df["return_1d"]     = df["Close"].pct_change()
     df["MA_10"]         = df["Close"].rolling(10).mean()
     df["MA_50"]         = df["Close"].rolling(50).mean()
@@ -104,10 +76,9 @@ def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
     delta = df["Close"].diff()
     gain  = delta.clip(lower=0).rolling(14).mean()
     loss  = (-delta.clip(upper=0)).rolling(14).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    df["RSI"] = 100 - (100 / (1 + rs))
+    df["RSI"] = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
 
-    # ── Chart-only indicators (kept separate — NOT in dropna) ──
+    # Chart indicators (NOT in dropna)
     df["MA_20"]    = df["Close"].rolling(20).mean()
     df["MA_200"]   = df["Close"].rolling(200).mean()
     df["BB_Mid"]   = df["Close"].rolling(20).mean()
@@ -120,14 +91,20 @@ def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df["MACD_Sig"] = df["MACD"].ewm(span=9, adjust=False).mean()
     df["MACD_H"]   = df["MACD"] - df["MACD_Sig"]
 
-    # ── Drop ONLY rows where model features are NaN (NOT chart indicators) ──
+    # Drop only on model features
     df = df.dropna(subset=FEATURE_COLS)
-
     return df
 
 
 def get_prediction_row(ticker: str) -> dict:
-    df         = get_latest_data(ticker)
+    df = get_latest_data(ticker)
+
+    if len(df) < 2:
+        raise ValueError(
+            f"Not enough data for {ticker} after feature computation. "
+            f"Got {len(df)} rows."
+        )
+
     latest     = df.iloc[-1]
     prev_close = df.iloc[-2]["Close"]
 
@@ -168,15 +145,12 @@ def explain_signal_text(latest: pd.Series, signal: str, prob: float) -> list:
     else:
         reasons.append((f"MACD ({macd:.3f}) below signal ({macd_s:.3f}) — bearish crossover.", "bearish"))
 
-    if close > ma50:
-        reasons.append((f"Price ${close:.2f} above MA50 ${ma50:.2f} — uptrend intact.", "bullish"))
-    else:
-        reasons.append((f"Price ${close:.2f} below MA50 ${ma50:.2f} — downtrend.", "bearish"))
+    reasons.append((f"Price ${close:.2f} {'above' if close > ma50 else 'below'} MA50 ${ma50:.2f} — "
+                    f"{'uptrend intact' if close > ma50 else 'downtrend'}.", "bullish" if close > ma50 else "bearish"))
 
-    if ma10 > ma50:
-        reasons.append((f"MA10 ${ma10:.2f} > MA50 ${ma50:.2f} — Golden Cross zone.", "bullish"))
-    else:
-        reasons.append((f"MA10 ${ma10:.2f} < MA50 ${ma50:.2f} — Death Cross zone.", "bearish"))
+    reasons.append((f"MA10 ${ma10:.2f} {'>' if ma10 > ma50 else '<'} MA50 ${ma50:.2f} — "
+                    f"{'Golden Cross zone' if ma10 > ma50 else 'Death Cross zone'}.",
+                    "bullish" if ma10 > ma50 else "bearish"))
 
     if not (np.isnan(bb_up) or np.isnan(bb_lo)) and (bb_up - bb_lo) > 0:
         bb_pct = (close - bb_lo) / (bb_up - bb_lo) * 100
